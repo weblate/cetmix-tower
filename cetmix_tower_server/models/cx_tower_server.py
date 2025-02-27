@@ -3,11 +3,13 @@
 import ast
 import io
 import logging
+from functools import wraps
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 from odoo.tools.safe_eval import safe_eval
 
+from ..ssh.ssh import SSHConnection, SSHManager
 from .constants import (
     ANOTHER_COMMAND_RUNNING,
     FILE_CREATION_FAILED,
@@ -20,235 +22,16 @@ from .tools import generate_random_id
 _logger = logging.getLogger(__name__)
 
 
-try:
-    from paramiko import (
-        AutoAddPolicy,
-        DSSKey,
-        ECDSAKey,
-        Ed25519Key,
-        RSAKey,
-        SFTPClient,
-        SSHClient,
-        SSHException,
-    )
-except ImportError:
-    _logger.error(
-        "import 'paramiko' error, please try to install: pip install paramiko"
-    )
-    AutoAddPolicy = RSAKey = SSHClient = None
+def after_commit(func):
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        connection = self._get_ssh_client(raise_on_error=True)
 
+        @self.env.cr.postcommit.add
+        def called_after():
+            connection.disconnect()
 
-class SSH(object):
-    """
-    This is a class for communicating with remote servers via SSH.
-    """
-
-    def __init__(
-        self,
-        host,
-        port,
-        username,
-        password=None,
-        ssh_key=None,
-        mode="p",
-        allow_agent=False,
-        timeout=5000,
-    ):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.mode = mode
-        self.password = password
-        self.ssh_key = ssh_key
-        self.timeout = timeout
-        # NB: allow_agent=False is for avoiding
-        # ssh-agent related connection issues~
-        self.allow_agent = allow_agent
-
-        self._ssh = None
-        self._sftp = None
-
-    def __del__(self):
-        """
-        Close connection after executing methods
-        """
-        self.disconnect()
-
-    def _get_ssh_key(self):
-        """
-        Retrieve the SSH key object for establishing an SSH connection.
-
-        This function attempts to load the key using supported formats
-        (RSA, DSS, ECDSA, Ed25519).
-
-        Returns:
-            pkey object: The SSH key object for use in connection parameters.
-
-        Raises:
-            ValidationError: If the key format is unsupported or the key is
-            incorrect.
-        """
-        ssh_key_file = io.StringIO(self.ssh_key)
-        for pkey_class in (RSAKey, DSSKey, ECDSAKey, Ed25519Key):
-            try:
-                # reset file pointer to the start for each key format attempt
-                ssh_key_file.seek(0)
-                return pkey_class.from_private_key(ssh_key_file)
-            except SSHException:
-                _logger.warning(
-                    f"{pkey_class.__name__} failed to load key, trying next format."
-                )
-
-        _logger.error("Failed to load SSH key: unsupported format or incorrect key.")
-        raise ValidationError(
-            _("Error loading a private key. Unsupported key format or incorrect key.")
-        )
-
-    def _connect(self):
-        """
-        Connect to remote host
-        """
-        self._ssh = SSHClient()  # type: ignore
-        self._ssh.load_system_host_keys()
-        self._ssh.set_missing_host_key_policy(AutoAddPolicy())  # type: ignore
-        kwargs = {
-            "hostname": self.host,
-            "port": self.port,
-            "username": self.username,
-            "allow_agent": self.allow_agent,
-            "timeout": self.timeout,
-        }
-        if self.mode == "p":
-            kwargs.update(
-                {
-                    "password": self.password,
-                }
-            )
-        elif self.mode == "k":
-            kwargs.update(
-                {
-                    "pkey": self._get_ssh_key(),
-                }
-            )
-        self._ssh.connect(**kwargs)
-        return self._ssh
-
-    @property
-    def connection(self):
-        """
-        Open SSH connection to remote host.
-        """
-        return self._connect()
-
-    @property
-    def sftp(self):
-        """
-        Open SFTP connection to remote host.
-        """
-        self._sftp = SFTPClient.from_transport(self.connection.get_transport())  # type: ignore
-        return self._sftp
-
-    def disconnect(self):
-        """
-        Close SSH & SFTP connection.
-        """
-        logger = logging.getLogger("paramiko")
-        if self._ssh:
-            logger.info("Disconnect SSH connection")
-            self._ssh.close()
-        if self._sftp:
-            logger.info("Disconnect SFTP connection")
-            self._sftp.close()
-
-    def exec_command(self, command, sudo=None):
-        """_summary_
-
-        Args:
-            command (text): Command text
-            sudo (selection): Use sudo
-                - 'n': no password
-                - 'p': with password
-                - Defaults to None.
-
-        Returns:
-            status, response, error
-        """
-        # Check this
-        # https://stackoverflow.com/questions/22587855/running-sudo-command-with-paramiko
-
-        sudo_with_password = sudo == "p" and self.username != "root"
-        if sudo_with_password:
-            # Return error if password is not set
-            if not self.password:
-                error_message = [_("sudo password was not provided!")]
-                return 255, [], error_message
-
-        stdin, stdout, stderr = self.connection.exec_command(command)
-
-        # Send password to stdin
-        if sudo_with_password:
-            stdin.write(self.password + "\n")  # type: ignore
-            stdin.flush()
-            # TODO: add password error check
-
-        status = stdout.channel.recv_exit_status()
-        response = stdout.readlines()
-        error = stderr.readlines()
-        return status, response, error
-
-    def delete_file(self, remote_path):
-        """
-        Delete file from remote server
-
-        Args:
-            remote_path (Text): full path file location with file type
-             (e.g. /test/my_file.txt).
-        """
-        self.sftp.remove(remote_path)
-
-    def upload_file(self, file, remote_path):
-        """
-        Upload file to remote server.
-
-        Args:
-            file (Text, Bytes): If bytes - file presented as contents of an
-                                open file object (fl).
-                                if text - file presented as local path to file
-            remote_path (Text): full path file location with file type
-            (e.g. /test/my_file.txt).
-
-        Raise:
-            TypeError: incorrect type of file.
-
-        Returns:
-            Result (class paramiko.sftp_attr.SFTPAttributes): metadata
-             of the uploaded file.
-        """
-        if isinstance(file, io.BytesIO):
-            result = self.sftp.putfo(file, remote_path)
-        elif isinstance(file, str):
-            result = self.sftp.put(file, remote_path=remote_path, recursive=True)
-        else:
-            raise TypeError(
-                "Incorrect type of file ({}) allowed: string, BytesIO.".format(
-                    type(file).__name__
-                )
-            )
-        return result
-
-    def download_file(self, remote_path):
-        """
-        Download file from remote server
-
-        Args:
-            remote_path (Text): full path file location with file type
-             (e.g. /test/my_file.txt).
-
-        Returns:
-            Result (Bytes): file content.
-        """
-        file = self.sftp.open(remote_path)
-        return file.read()
+    return wrapped
 
 
 class CxTowerServer(models.Model):
@@ -649,20 +432,21 @@ class CxTowerServer(models.Model):
                 the server cannot be found.
 
         Returns:
-            SSH: SSH client instance or False and exception content
+            SSH: SSH manager instance or False and exception content
         """
         self.ensure_one()
         self = self.sudo()
         try:
-            client = SSH(
+            connection = SSHConnection(
                 host=self.ip_v4_address or self.ip_v6_address,
                 port=self.ssh_port,
                 username=self.ssh_username,
-                mode=self.ssh_auth_mode,
                 password=self._get_password(),
                 ssh_key=self._get_ssh_key(),
+                mode=self.ssh_auth_mode,
                 timeout=timeout,
             )
+            client = SSHManager(connection)
         except Exception as e:
             if raise_on_error:
                 raise ValidationError(_("SSH connection error %(err)s", err=e)) from e
@@ -709,7 +493,7 @@ class CxTowerServer(models.Model):
 
         if not try_command and not try_file:
             try:
-                client._connect()
+                client.connection.connect()
                 return {
                     "status": 0,
                     "response": _("Connection successful."),
@@ -1359,6 +1143,7 @@ class CxTowerServer(models.Model):
         else:
             return result
 
+    @after_commit
     def _execute_command_using_ssh(
         self,
         client,
@@ -1418,14 +1203,14 @@ class CxTowerServer(models.Model):
 
             # Command is a single sting. No 'sudo' or 'sudo' w/o password
             if isinstance(prepared_command_code, str):
-                status, response, error = client.exec_command(
+                status, response, error = client.command_executor.exec_command(
                     prepared_command_code, sudo=sudo
                 )
 
             # Multiple commands: sudo with password
             elif isinstance(prepared_command_code, list):
                 for cmd in prepared_command_code:
-                    st, resp, err = client.exec_command(cmd, sudo=sudo)
+                    st, resp, err = client.command_executor.exec_command(cmd, sudo=sudo)
                     status.append(st)
                     response += resp
                     error += err
@@ -1435,6 +1220,8 @@ class CxTowerServer(models.Model):
                 status = -1
 
         except Exception as e:
+            # Close connection after exception
+            client.connection.disconnect()
             if raise_on_error:
                 _logger.error(f"SSH execute command error: {e}")
                 raise ValidationError(
@@ -1710,6 +1497,7 @@ class CxTowerServer(models.Model):
             "context": context,
         }
 
+    @after_commit
     def delete_file(self, remote_path):
         """
         Delete file from remote server
@@ -1720,8 +1508,9 @@ class CxTowerServer(models.Model):
         """
         self.ensure_one()
         client = self._get_ssh_client(raise_on_error=True)
-        client.delete_file(remote_path)
+        client.sftp_service.delete_file(remote_path)
 
+    @after_commit
     def upload_file(self, data, remote_path, from_path=False):
         """
         Upload file to remote server.
@@ -1743,15 +1532,17 @@ class CxTowerServer(models.Model):
         self.ensure_one()
         client = self._get_ssh_client(raise_on_error=True)
         if from_path:
-            result = client.upload_file(data, remote_path)
+            result = client.sftp_service.upload_file(data, remote_path)
         else:
             # Convert string to bytes
             if isinstance(data, str):
                 data = data.encode()
             file = io.BytesIO(data)
-            result = client.upload_file(file, remote_path)
+            result = client.sftp_service.upload_file(file, remote_path)
+
         return result
 
+    @after_commit
     def download_file(self, remote_path):
         """
         Download file from remote server
@@ -1769,8 +1560,11 @@ class CxTowerServer(models.Model):
         self.ensure_one()
         client = self._get_ssh_client(raise_on_error=True)
         try:
-            result = client.download_file(remote_path)
+            result = client.sftp_service.download_file(remote_path)
+
         except FileNotFoundError as fe:
+            # Close connection after exception
+            client.connection.disconnect()
             raise ValidationError(
                 _("The file %(f_path)s not found.", f_path=remote_path)
             ) from fe
